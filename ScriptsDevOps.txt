@@ -1,0 +1,163 @@
+===================================================================================================================================
+
+1- Parâmetro de Texto
+  - Nome: DOCKER_HOST
+  - Valor: tcp://127.0.0.1:2376
+2- Parâmetro de Texto
+  - Nome: image
+  - Valor: danielfns/mobead_image_build:${BUILD_NUMBER)
+
+===================================================================================================================================
+
+-- Build Steps:
+1- Script Shell:
+# Comando validando Dockerfile com Hadolint
+docker run --rm -i hadolint/hadolint < Dockerfile
+
+2- Script Shell:
+#!/bin/bash
+
+# Definir o JAVA_HOME para garantir que o Java 17 seja usado
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+export PATH=$JAVA_HOME/bin:$PATH
+
+# Usar o caminho completo para o SonarQube Scanner
+/opt/sonar-scanner/bin/sonar-scanner \
+  -Dsonar.projectKey=jenkins \
+  -Dsonar.sources=. \
+  -Dsonar.host.url=http://192.168.1.8:9000 \
+  -X \
+  -Dsonar.login=sqp_eeac9ae2974e45e7d7af7d4a9d9894b1b32c5e73
+
+3- Scrip Shell para Pipeline PRODUÇÃO:
+#!/bin/sh
+{
+    docker run -d -p 82:80 --name=mobead_image_build-prod $image
+} || { 
+    # Se o container já existir, removê-lo e reiniciar com a nova imagem
+    docker rm -f mobead_image_build-prod
+    docker run -d -p 82:80 --name=mobead_image_build-prod $image
+}
+
+===================================================================================================================================
+
+-- Pipeline Script para BUILD DEV:
+pipeline {
+    environment {
+        registry = "danielfns/mobead_image_build"
+        registryCredential = 'dockerhub'
+        dockerImageDev = ''
+        dockerImageProd = ''
+        SLACK_WEBHOOK_URL = 'webhook_slack'
+        SLACK_CHANNEL = '#pós-graduação-engenharia-devops'
+    }
+    agent any
+    stages {
+        stage('Lint Dockerfile') {
+            steps {
+                echo "Pipeline Usando Jenkinsfile - Ambiente de Desenvolvimento"
+                sh 'docker run --rm -i hadolint/hadolint < Dockerfile'
+            }
+        }
+        stage('Build Image - Desenvolvimento') {
+            steps {
+                script {
+                    dockerImageDev = docker.build registry + ":dev-$BUILD_NUMBER"
+                }
+            }
+        }
+        stage('Deploy - Desenvolvimento') {
+            steps {
+                script {
+                    // Remover o container antigo de desenvolvimento, se existir
+                    sh 'docker rm -f mobead_image_build-dev || true'
+                    
+                    // Rodar o container de desenvolvimento na porta 81
+                    docker.withRegistry('https://registry-1.docker.io/v2/', 'dockerhub') {
+                        dockerImageDev.push("dev-$BUILD_NUMBER")
+                        sh 'docker run -d -p 81:80 --name=mobead_image_build-dev ' + dockerImageDev.imageName()
+                    }
+                    echo 'Deploy no ambiente de desenvolvimento concluído!'
+                }
+            }
+        }
+        stage('Notificar Deploy - Desenvolvimento') {
+            steps {
+                script {
+                    // Notifica o canal Slack sobre o sucesso do deploy de desenvolvimento
+                    slackSend(
+                        channel: "${env.SLACK_CHANNEL}",
+                        color: '#36a64f',
+                        message: "O deploy de desenvolvimento foi concluído com sucesso no Job: ${env.JOB_NAME} - Build: ${env.BUILD_NUMBER}. Acesse a aplicação DEV em: http://192.168.1.8:81/",
+                        webhookUrl: "${env.SLACK_WEBHOOK_URL}"
+                    )
+                }
+            }
+        }
+        stage('Solicitar Aprovação para Deploy de Produção') {
+            steps {
+                script {
+                    // Enviar mensagem para o Slack solicitando aprovação para o build de produção
+                    slackSend(
+                        channel: "${env.SLACK_CHANNEL}",
+                        color: '#FFFF00',
+                        message: "@channel: A aprovação para o deploy de produção (porta 82:80) é necessária para o Job: ${env.JOB_NAME} - Build: ${env.BUILD_NUMBER}. Acesse o Jenkins para aprovar: ${env.BUILD_URL}",
+                        webhookUrl: "${env.SLACK_WEBHOOK_URL}"
+                    )
+                }
+            }
+        }
+        stage('Aprovação Manual para Produção') {
+            steps {
+                // Solicita aprovação manual para prosseguir com o deploy em produção
+                input message: 'Aprovação necessária para prosseguir com o deploy em produção. Aprovar?'
+            }
+        }
+        stage('Build Image - Produção') {
+            steps {
+                script {
+                    dockerImageProd = docker.build registry + ":prod-$BUILD_NUMBER"
+                }
+            }
+        }
+        stage('Deploy - Produção') {
+            steps {
+                script {
+                    // Remover o container antigo de produção, se existir
+                    sh 'docker rm -f mobead_image_build-prod || true'
+                    
+                    // Rodar o container de produção na porta 82
+                    docker.withRegistry('https://registry-1.docker.io/v2/', 'dockerhub') {
+                        dockerImageProd.push("prod-$BUILD_NUMBER")
+                        sh 'docker run -d -p 82:80 --name=mobead_image_build-prod ' + dockerImageProd.imageName()
+                    }
+                    echo 'Deploy no ambiente de produção concluído!'
+                }
+            }
+        }
+    }
+    post {
+        success {
+            script {
+                // Notifica o Slack sobre o sucesso do deploy em produção
+                slackSend(
+                    channel: "${env.SLACK_CHANNEL}",
+                    color: '#36a64f',
+                    message: "O deploy em produção foi concluído com sucesso no Job: ${env.JOB_NAME} - Build: ${env.BUILD_NUMBER}. Acesse a aplicação PROD em: http://192.168.1.8:82/",
+                    webhookUrl: "${env.SLACK_WEBHOOK_URL}"
+                )
+            }
+        }
+        failure {
+            script {
+                // Notifica o Slack sobre falha no deploy em qualquer etapa
+                slackSend(
+                    channel: "${env.SLACK_CHANNEL}",
+                    color: '#FF0000',
+                    message: "Falha no deploy para o Job: ${env.JOB_NAME} - Build: ${env.BUILD_NUMBER}",
+                    webhookUrl: "${env.SLACK_WEBHOOK_URL}"
+                )
+            }
+        }
+    }
+}
